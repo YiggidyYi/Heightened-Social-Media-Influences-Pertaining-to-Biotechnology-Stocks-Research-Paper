@@ -1,0 +1,165 @@
+!pip install pandas_datareader
+!pip install yfinance 
+
+import io, json, requests, time, os, os.path, math, urllib
+from sys import stdout
+from collections import Counter
+import pandas as pd
+from pandas_datareader import data as pdr
+import yfinance as yf
+yf.pdr_override()
+
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn import svm
+from sklearn import linear_model
+from pandas_datareader.data import get_data_yahoo
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import seaborn as sns
+%matplotlib inline
+
+# returns python object representation of JSON in response
+def get_response(symbol, older_than, retries=5):
+    url = 'https://api.stocktwits.com/api/2/streams/symbol/%s.json?max=%d' % (symbol, older_than-1)
+    for _ in range(retries):
+        response = requests.get(url)
+        if response.status_code == 200:
+            return json.loads(response.content)
+        elif response.status_code == 429:
+            print (response.content)
+            return None
+        time.sleep(1.0)
+    # couldn't get response
+    return None
+
+# extends the current dataset for a given symbol with more tweets
+def get_older_tweets(symbol, num_queries):    
+    path = './data/%s.json' % symbol
+    if os.path.exists(path):
+        # extending an existing json file
+        with open(path, 'r') as f:
+            data = json.load(f)
+            if len(data) > 0:
+                older_than = data[-1]['id']
+            else:
+                older_than = int(1000000000000)
+    else:
+        # creating a new json file
+        data = []
+        older_than = int(1000000000000) # any huge number
+    
+    for i in range(int(num_queries)):
+        content = get_response(symbol, older_than)
+        if content == None:
+            print ('Error, an API query timed out')
+            break
+        data.extend(content['messages'])
+        older_than = data[-1]['id']
+        stdout.write('\rSuccessfully made query %d' % (i+1))
+        stdout.flush()
+        # sleep to make sure no throttle
+        time.sleep(0.5)
+        
+    # write the new data to the JSON file
+    with open(path, 'w') as f:
+        json.dump(data, f)
+    print
+    print ('Done')
+
+# get some data
+# apparently a client can only make 200 requests an hour
+# make data directory if needed
+if not os.path.exists('./data'):
+    os.mkdir('./data')
+
+symbols = ['PFE','MRK','JNJ','BMY','ABBV','GILD','HLN','AZN','GSK','MRNA']
+tweets_per_symbol = 10000
+for symbol in symbols:
+    path = './data/%s.json' % symbol
+    if os.path.exists(path):
+        with open(path, 'r') as f:
+            num_tweets = len(json.load(f))
+    else:
+        num_tweets = 0
+    num_queries = (tweets_per_symbol - num_tweets - 1)/30 + 1
+    if num_queries > 0:
+        print ('Getting tweets for symbol %s' % symbol)
+        get_older_tweets(symbol, num_queries)
+
+# Function takes in a JSON and returns a Pandas DataFrame for easier operation. 
+def stocktwits_json_to_df(data, verbose=False):
+    #data = json.loads(results)
+    columns = ['id','created_at','username','name','user_id','body','basic_sentiment','reshare_count']
+    db = pd.DataFrame(index=range(len(data)),columns=columns)
+    for i, message in enumerate(data):
+        db.loc[i,'id'] = message['id']
+        db.loc[i,'created_at'] = message['created_at']
+        db.loc[i,'username'] = message['user']['username']
+        db.loc[i,'name'] = message['user']['name']
+        db.loc[i,'user_id'] = message['user']['id']
+        db.loc[i,'body'] = message['body']
+        #We'll classify bullish as +1 and bearish as -1 to make it ready for classification training
+        try:
+            if (message['entities']['sentiment']['basic'] == 'Bullish'):
+                db.loc[i,'basic_sentiment'] = 1
+            elif (message['entities']['sentiment']['basic'] == 'Bearish'):
+                db.loc[i,'basic_sentiment'] = -1
+            else:
+                db.loc[i,'basic_sentiment'] = 0
+        except:
+                db.loc[i,'basic_sentiment'] = 0
+        #db.loc[i,'reshare_count'] = message['reshares']['reshared_count']
+        for j, symbol in enumerate(message['symbols']):
+                db.loc[i,'symbol'+str(j)] = symbol['symbol']
+        if verbose:
+            #print message
+            print (db.loc[i,:])
+    db['created_at'] = pd.to_datetime(db['created_at'])
+    return db
+
+filename = 'PFE.json' #(Ticker was changed when gathering data from each company)
+path = './data/%s' % filename
+with open(path, 'r') as f:
+    data = json.load(f)
+db = stocktwits_json_to_df(data)
+print ('%d examples extracted ' % db.shape[0])
+
+#Code was used to find start-end date of Stocktwits data
+enddate = db['created_at'].max()
+startdate = db['created_at'].min()
+print (startdate, enddate)
+stock_data = get_data_yahoo('PFE', startdate, enddate) #(Ticker was changed when gathering data from each company)
+
+#Counts mentions and bullish/bearish ratio of stock tweets collected
+def tweet_metrics(stock_data, stock_tweets):
+    stock_data['mentions'] = np.zeros(stock_data.shape[0])
+    stock_data['total_bullish'] = np.zeros(stock_data.shape[0])
+    stock_data['total_bearish'] = np.zeros(stock_data.shape[0])
+    stock_data['total_predictions'] = np.zeros(stock_data.shape[0])
+    stock_data['bull_ratio'] = np.zeros(stock_data.shape[0])
+    stock_data['bear_ratio'] = np.zeros(stock_data.shape[0])
+    for i, d in enumerate(stock_data.index):
+        tweets_on_d = stock_tweets[stock_tweets['created_at'].dt.date==d.date()]
+        stock_data.loc[d,'mentions'] = tweets_on_d.shape[0]
+        stock_data.loc[d,'total_bullish'] = tweets_on_d[tweets_on_d['basic_sentiment']==1].shape[0]
+        stock_data.loc[d,'total_bearish'] = tweets_on_d[tweets_on_d['basic_sentiment']==-1].shape[0]
+        stock_data.loc[d,'total_predictions'] =  stock_data.loc[d,'total_bearish'] +  stock_data.loc[d,'total_bullish']
+        stock_data.loc[d,'bull_ratio'] = stock_data.loc[d,'total_bullish']/float(stock_data.loc[d,'total_predictions'])
+        stock_data.loc[d,'bear_ratio'] = stock_data.loc[d,'total_bearish']/float(stock_data.loc[d,'total_predictions'])
+    return stock_data
+
+start_date = '2022-01-01' #(Date was Adjusted when gathering data from each company)
+end_date = '2022-01-31' #(Date was adjusted when gathering data from each company)
+interval_metrics = stock_metrics.loc[start_date:end_date]
+print(interval_metrics[['mentions', 'total_bullish', 'total_bearish', 'bull_ratio']])
+
+#Identify the dates when spurges occured
+# Compute the rolling average of "mentions" over 30-day period
+rolling_avg = stock_metrics['mentions'].rolling('30D').mean()
+# Exclude days with zero mentions from the rolling average calculation
+rolling_avg = rolling_avg[rolling_avg != 0]
+# Boolean indexing to select rows where "mentions" exceed the rolling average by over 400%
+mask = (stock_metrics['mentions'] > rolling_avg * 4) & (stock_metrics['mentions'] > 0)
+mentions_exceed_avg = stock_metrics[mask]
+print(mentions_exceed_avg.index)
